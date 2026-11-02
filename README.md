@@ -28,7 +28,8 @@ The notebooks use Databricks **source format**: `.py` files where `# COMMAND ---
 
 ### What the synthetic data includes
 
-- **Patient journeys:** A01 admit, then an A02 transfer (40% of encounters) and an A08 update (30%), then an A03 discharge. Patients whose stay extends past "now" are still in-house.
+- **Patient journeys:** A01 admit, then an A02 transfer and an A08 update along the way, then an A03 discharge.
+- **Carry-over between runs:** patients still in-house at the end of a run are saved to `producer/state/in_house.json` (git-ignored). The next run continues their stays, so the gold EHR feed sees real updates (transfers, discharges) and not just new admits. `--fresh` starts over.
 - **Two API snapshots per encounter:** one at admit with the principal diagnosis, and a fuller one at discharge that adds a secondary diagnosis and the discharge disposition.
 - **Realistic messiness:**
   - About 2% of ADT messages are resent (deduped in silver).
@@ -44,7 +45,14 @@ The notebooks use Databricks **source format**: `.py` files where `# COMMAND ---
 
 1. Sign up at confluent.cloud (new accounts get free credits) and create a **Basic** cluster.
 2. Create two topics: `adt_events` and `encounter_details`.
-3. Create an **API key** for the cluster. Copy the key, the secret, and the bootstrap server.
+3. Create two **service accounts**, each with an API key, so each side only gets the access it needs:
+
+   | Service account | Used by | ACLs |
+   |---|---|---|
+   | `adt-producer` | `.env` (local producer) | **Write** + **Describe** on topics `adt_events` and `encounter_details` |
+   | `databricks-consumer` | Databricks secret scope | **Read** + **Describe** on both topics, plus **Read** on consumer group prefix `spark-kafka-source` |
+
+   A service account key's permissions come from that account's ACLs, which can cover any number of topics. For quick local testing, a key tied to your own user account also works. It has your full permissions on the cluster, so keep it out of shared environments. Copy each key's secret and the cluster's bootstrap server.
 
 ## 3. Credentials
 

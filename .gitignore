@@ -14,3 +14,6 @@ venv/
 # OS / editor
 .DS_Store
 .vscode/
+
+# Producer simulation state (in-house patients carried between runs)
+producer/state/

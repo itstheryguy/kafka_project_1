@@ -5,12 +5,14 @@ Two topics:
   encounter_details  JSON encounter snapshots. In production you'd queue each encounter_id from the
                      ADT feed and call an API for these; here we publish the "API response" directly.
 
-All patients are fake (Faker). Each run simulates --hours of activity ending now, so encounters
-admitted recently are still in-house and show up in the census.
+All patients are fake (Faker). Patients still in-house at the end of a run are saved to
+producer/state/in_house.json. The next run picks them up and continues their stays (transfers, updates,
+discharges) alongside new admits, so downstream MERGEs see real updates and not just inserts.
 
 Usage:
     python producer/produce_events.py --dry-run          # print a few messages, no Kafka needed
     python producer/produce_events.py --encounters 50
+    python producer/produce_events.py --fresh            # ignore saved in-house patients
 """
 
 import argparse
@@ -19,7 +21,8 @@ import os
 import random
 import time
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 
 from dotenv import load_dotenv
 from faker import Faker
@@ -27,6 +30,7 @@ from faker import Faker
 load_dotenv()
 ADT_TOPIC = os.getenv("KAFKA_ADT_TOPIC", "adt_events")
 DETAILS_TOPIC = os.getenv("KAFKA_DETAILS_TOPIC", "encounter_details")
+STATE_FILE = Path(__file__).parent / "state" / "in_house.json"
 
 fake = Faker()
 FACILITY = "GENHOSP"
@@ -92,7 +96,7 @@ def new_encounter(window_start: datetime, now: datetime) -> dict:
         "address": f"{fake.street_address()}^^{fake.city()}^{fake.state_abbr()}^{fake.zipcode()}",
         "attending": random.choice(ATTENDINGS),
         "admit": admit,
-        "discharge": discharge if discharge < now else None,
+        "discharge": discharge,  # planned; only sent once a run's clock passes it
         "acuity": random.randint(1, 5),
         "payer": random.choice(PAYERS),
         "disposition": random.choices(*DISPOSITIONS)[0],
@@ -134,15 +138,17 @@ def details_snapshot(enc: dict, fetched_at: datetime, final: bool) -> dict:
     }
 
 
-def timeline(enc: dict, now: datetime) -> list:
-    """All messages for one encounter as (timestamp, topic, key, value)."""
-    end = enc["discharge"] or now
-    events = [(enc["admit"], "A01")]
-    if random.random() < 0.4:
-        events.append((enc["admit"] + (end - enc["admit"]) * random.uniform(0.2, 0.7), "A02"))
-    if random.random() < 0.3:
-        events.append((enc["admit"] + (end - enc["admit"]) * random.uniform(0.1, 0.9), "A08"))
-    if enc["discharge"]:
+def timeline(enc: dict, start: datetime, now: datetime) -> list:
+    """Messages for one encounter between start and now, as (timestamp, topic, key, value).
+
+    start is the admit time for a new encounter, or the previous run's end for a carried-over one.
+    """
+    end = min(enc["discharge"], now)
+    events = [(enc["admit"], "A01")] if enc["admit"] >= start else []
+    for event, chance in (("A02", 0.4), ("A08", 0.3)):
+        if random.random() < chance:
+            events.append((start + (end - start) * random.uniform(0.1, 0.9), event))
+    if enc["discharge"] <= now:
         events.append((enc["discharge"], "A03"))
     events.sort()
 
@@ -164,19 +170,52 @@ def timeline(enc: dict, now: datetime) -> list:
     return out
 
 
+def simulate(n_new: int, hours: int, now: datetime, state: dict | None) -> tuple[list, dict]:
+    """Continue carried-over in-house encounters and admit n_new more. Returns (messages, next state)."""
+    since = datetime.fromisoformat(state["as_of"]) if state else now - timedelta(hours=hours)
+    jobs = [(enc, since) for enc in state["encounters"]] if state else []
+    for _ in range(n_new):
+        enc = new_encounter(since, now)
+        jobs.append((enc, enc["admit"]))
+
+    messages = []
+    for enc, start in jobs:
+        messages += timeline(enc, start, now)
+    messages.sort(key=lambda m: m[0])
+    in_house = [enc for enc, _ in jobs if enc["discharge"] > now]
+    return messages, {"as_of": now.isoformat(), "encounters": in_house}
+
+
+def load_state() -> dict | None:
+    if not STATE_FILE.exists():
+        return None
+    state = json.loads(STATE_FILE.read_text())
+    for enc in state["encounters"]:
+        enc["admit"] = datetime.fromisoformat(enc["admit"])
+        enc["discharge"] = datetime.fromisoformat(enc["discharge"])
+        enc["dob"] = date.fromisoformat(enc["dob"])
+    return state
+
+
+def save_state(state: dict):
+    STATE_FILE.parent.mkdir(exist_ok=True)
+    STATE_FILE.write_text(json.dumps(state, default=lambda v: v.isoformat(), indent=1))
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--encounters", type=int, default=50)
-    parser.add_argument("--hours", type=int, default=72, help="simulated window ending now")
+    parser.add_argument("--encounters", type=int, default=50, help="new admits this run")
+    parser.add_argument("--hours", type=int, default=72, help="simulated window for the first run")
     parser.add_argument("--delay", type=float, default=0.02, help="seconds between messages")
     parser.add_argument("--dry-run", action="store_true", help="print a few messages instead of sending")
+    parser.add_argument("--fresh", action="store_true", help="ignore saved in-house patients")
     args = parser.parse_args()
 
     now = datetime.now(timezone.utc).replace(microsecond=0)
-    messages = []
-    for _ in range(args.encounters):
-        messages += timeline(new_encounter(now - timedelta(hours=args.hours), now), now)
-    messages.sort(key=lambda m: m[0])
+    state = None if args.fresh else load_state()
+    messages, next_state = simulate(args.encounters, args.hours, now, state)
+    if state:
+        print(f"Continuing {len(state['encounters'])} in-house encounters from {state['as_of']}")
 
     if args.dry_run:
         for _, topic, key, value in messages[:6]:
@@ -194,9 +233,12 @@ def main():
         "sasl.password": os.environ["KAFKA_API_SECRET"],
     })
 
+    failures = []
+
     def on_delivery(err, msg):
         if err:
-            print(f"Delivery failed: {err}")
+            failures.append(err)
+            print(f"Delivery failed ({msg.topic()}): {err}")
 
     sent = 0
     for _, topic, key, value in messages:
@@ -209,7 +251,13 @@ def main():
         time.sleep(args.delay)
 
     producer.flush()
-    print(f"Sent {sent} messages ({sent - len(messages)} duplicates) for {args.encounters} encounters")
+    if failures:
+        # Don't advance the simulation past messages Kafka never received.
+        print(f"{len(failures)} of {sent} messages failed; in-house state NOT saved. Fix the error and re-run.")
+        return
+    save_state(next_state)
+    print(f"Sent {sent} messages ({sent - len(messages)} duplicates); "
+          f"{len(next_state['encounters'])} patients still in-house")
 
 
 if __name__ == "__main__":
