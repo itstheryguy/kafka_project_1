@@ -1,0 +1,16 @@
+# Secrets
+.env
+*.pem
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Databricks CLI / bundles
+.databricks/
+
+# OS / editor
+.DS_Store
+.vscode/
