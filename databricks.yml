@@ -1,0 +1,75 @@
+# Databricks Asset Bundle: defines the ADT pipeline job as code.
+#
+#   databricks bundle validate            # check config
+#   databricks bundle deploy -t dev       # deploy dev copy (schedule paused, writes to adt_demo_dev)
+#   databricks bundle run adt_pipeline    # trigger a run of the dev copy
+#   databricks bundle deploy -t prod      # deploy scheduled copy (writes to adt_demo)
+
+bundle:
+  name: kafka_project_1
+
+variables:
+  catalog:
+    description: Unity Catalog catalog for all tables
+    default: workspace
+  schema:
+    description: Schema for bronze/silver/gold tables and checkpoints
+    default: adt_demo
+
+resources:
+  jobs:
+    adt_pipeline:
+      name: adt_pipeline
+      # Streaming checkpoints can't be shared by two runs at once.
+      max_concurrent_runs: 1
+      parameters:
+        - name: catalog
+          default: ${var.catalog}
+        - name: schema
+          default: ${var.schema}
+      schedule:
+        quartz_cron_expression: "0 0 6 * * ?"
+        timezone_id: America/Denver
+      email_notifications:
+        on_failure:
+          - ${workspace.current_user.userName}
+      # No cluster specified, so every task runs on serverless compute.
+      tasks:
+        - task_key: setup
+          notebook_task:
+            notebook_path: ./notebooks/00_setup.py
+
+        - task_key: bronze
+          depends_on:
+            - task_key: setup
+          notebook_task:
+            notebook_path: ./notebooks/02_bronze_ingest.py
+          max_retries: 1
+          min_retry_interval_millis: 60000
+
+        - task_key: silver
+          depends_on:
+            - task_key: bronze
+          notebook_task:
+            notebook_path: ./notebooks/03_silver_parse_and_stitch.py
+          max_retries: 1
+          min_retry_interval_millis: 60000
+
+        - task_key: gold
+          depends_on:
+            - task_key: silver
+          notebook_task:
+            notebook_path: ./notebooks/04_gold_ehr_and_analytics.py
+
+targets:
+  dev:
+    # Development mode prefixes the job name with [dev <user>] and pauses its schedule.
+    mode: development
+    default: true
+    variables:
+      schema: adt_demo_dev
+
+  prod:
+    mode: production
+    workspace:
+      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}

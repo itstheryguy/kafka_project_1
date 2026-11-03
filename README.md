@@ -86,9 +86,20 @@ databricks secrets put-secret kafka api-secret
 3. **`02` → `03` → `04`:** run them in order.
 4. **Repeat:** run the producer again, then re-run 02–04. Only new messages get processed, because the checkpoints track Kafka offsets. Gold only reports the encounters that changed.
 
+## 5. Orchestration (Databricks Asset Bundle)
+
+`databricks.yml` defines a Lakeflow Job that runs `setup → bronze → silver → gold` on serverless compute every day at 6:00 AM Mountain time. Bronze and silver retry once, failures send an email, and `max_concurrent_runs: 1` stops two runs from writing to the same streaming checkpoints at the same time.
+
+```bash
+databricks bundle validate
+databricks bundle deploy -t dev && databricks bundle run -t dev adt_pipeline   # schedule paused, writes to adt_demo_dev
+databricks bundle deploy -t prod                                                 # scheduled, writes to adt_demo
+```
+
+Deploying a bundle is a separate step from syncing the Git folder. Pulling in Databricks updates the files but doesn't create or change the job.
+
 ## Ideas to extend
 
-- Chain 02 → 03 → 04 as a scheduled **Lakeflow Job**
 - Rewrite silver as a **Lakeflow Declarative Pipeline** with expectations, such as "admit_ts not null" or "event_type in (A01, A02, A03, A08)", and a quarantine table
 - Handle A11/A13 cancel events (cancel admit, cancel discharge)
 - Build an AI/BI dashboard on `gold_unit_census` and `gold_encounter_analytics`
