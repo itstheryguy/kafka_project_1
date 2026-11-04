@@ -125,7 +125,7 @@ adt_events = (
 # MAGIC ## Current state per encounter (MERGE in foreachBatch)
 # MAGIC
 # MAGIC Streaming writes can only append, so keeping "one row per encounter" requires `foreachBatch` + `MERGE`.
-# MAGIC Two details are worth knowing for interviews:
+# MAGIC Two details keep it correct:
 # MAGIC 1. **Reduce the batch to one row per key first.** MERGE fails if several source rows match one target row,
 # MAGIC    e.g. an A01 and an A02 for the same encounter arriving in the same micro-batch.
 # MAGIC 2. **Only update when the incoming event is newer.** This guards against out-of-order delivery.

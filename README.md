@@ -4,21 +4,70 @@ An end-to-end healthcare streaming pipeline. A Python producer simulates a hospi
 
 All patient data is synthetic (Faker).
 
-```
-                    ┌─ adt_events (HL7 v2) ──────► bronze_adt_raw ──► silver_adt_events ──► silver_encounters ─┐
-producer ──Kafka────┤                                                                                         ├─► gold_ehr_encounter_sync (PHI, CDF → EHR)
-                    └─ encounter_details (JSON) ─► bronze_encounter_api_raw ──────────► silver_encounter_details ┘   gold_encounter_analytics (de-identified)
-                                                                                                                      gold_unit_census
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph src["Source systems (simulated by producer/)"]
+        adt["ADT interface<br/>HL7 v2: A01, A02, A08, A03"]
+        api["Encounter API<br/>JSON snapshots"]
+    end
+
+    subgraph kafka["Confluent Cloud Kafka"]
+        t1[["adt_events<br/>keyed by MRN"]]
+        t2[["encounter_details<br/>keyed by encounter_id"]]
+    end
+
+    subgraph dbx["Databricks: adt_pipeline job (daily, serverless, Unity Catalog)"]
+        subgraph bronze["Bronze: raw payloads"]
+            b1[("bronze_adt_raw")]
+            b2[("bronze_encounter_api_raw")]
+        end
+        subgraph silver["Silver: parsed, deduped, current state"]
+            s1[("silver_adt_events")]
+            s2[("silver_encounters")]
+            s3[("silver_encounter_details")]
+        end
+        subgraph gold["Gold: use-case tables"]
+            g1[("gold_ehr_encounter_sync<br/>PHI, Change Data Feed")]
+            g2[("gold_encounter_analytics<br/>de-identified")]
+            g3[("gold_unit_census")]
+            v1{{"v_ehr_sync_care_team<br/>PHI masked by group"}}
+        end
+    end
+
+    adt --> t1 --> b1
+    api --> t2 --> b2
+    b1 -- "parse HL7, dedupe on MSH-10" --> s1
+    s1 -- "MERGE latest per encounter" --> s2
+    b2 -- "parse JSON, MERGE latest" --> s3
+    s2 & s3 -- "left join" --> g1
+    s2 & s3 -- "left join" --> g2
+    g2 --> g3
+    g1 --> v1
+    g1 -. "table_changes" .-> ehr["EHR sync"]
+    g2 -.-> bi["Dashboards and analytics"]
 ```
 
 In a real hospital, the ADT feed would trigger a queue of `encounter_id`s, and a worker would call the EHR's API for each one. Here the producer publishes the "API response" straight to the `encounter_details` topic. Everything downstream works the same either way.
+
+## Design decisions
+
+- **Bronze keeps payloads untouched.** If parsing logic changes, silver can be rebuilt from bronze without depending on Kafka retention.
+- **HL7 is parsed with native Spark functions, not a Python UDF.** Parsing stays in the JVM, and missing fields return NULL (`get`, `try_to_timestamp`) instead of failing the batch.
+- **Duplicates are dropped on MSH-10,** the message control ID, within a watermark on Kafka arrival time. A watermark on HL7 event time would silently drop legitimately late messages, such as a delayed A03.
+- **Each micro-batch is reduced to one row per key before MERGE.** MERGE fails when several source rows match one target row, for example an A01 and an A02 for the same encounter in one batch.
+- **Updates only apply when newer** (`WHEN MATCHED AND s.ts > t.ts`), so out-of-order delivery can't roll an encounter back to an older state.
+- **Missing API details don't block the pipeline.** The gold join is a left join, and those encounters are flagged `PENDING_DETAILS`.
+- **The EHR feed only sends what changed.** A row hash skips no-op updates, and Change Data Feed exposes exactly which rows each run inserted or updated.
+- **PHI is separated by use case:** an identified EHR feed, a de-identified analytics table, and masking on the consumer side so the pipeline never reads redacted values.
+- **Least-privilege credentials:** the producer and Databricks use separate Kafka credentials, and Databricks reads its credentials from a secret scope.
 
 ## Layout
 
 | Path | What it does |
 |---|---|
 | `notebooks/00_setup.py` | Creates the schema and checkpoint volume, and checks that Kafka secrets exist |
-| `notebooks/01_spark_delta_fundamentals.py` | Spark/Delta interview warm-up. Standalone, no Kafka needed |
 | `notebooks/02_bronze_ingest.py` | Two Kafka topics → raw bronze tables |
 | `notebooks/03_silver_parse_and_stitch.py` | HL7 parsing with native Spark functions, dedupe on MSH-10, encounter state via `foreachBatch` + `MERGE` |
 | `notebooks/04_gold_ehr_and_analytics.py` | Stitched EHR feed with Change Data Feed, de-identified analytics, unit census, PHI-masking view |

@@ -92,9 +92,9 @@ display(spark.sql(f"""
 # MAGIC ## gold_encounter_analytics (de-identified)
 # MAGIC No names, MRN, DOB, or address. Age becomes an age band, and the encounter ID is replaced with a hash.
 # MAGIC
-# MAGIC Interview nuance: under HIPAA Safe Harbor, dates more specific than the year (like `admit_date`) also
-# MAGIC count as identifiers, and an unsalted hash of a known ID can be reversed by anyone holding the ID list.
-# MAGIC A production version would use a salted hash (salt kept in a secret scope) and could coarsen dates.
+# MAGIC **Limitations:** under HIPAA Safe Harbor, dates more specific than the year (like `admit_date`) also count as
+# MAGIC identifiers, and an unsalted hash of a known ID can be reversed by anyone holding the ID list. A production
+# MAGIC version would use a salted hash (salt kept in a secret scope) and coarsen dates as needed.
 
 # COMMAND ----------
 
@@ -138,12 +138,11 @@ analytics.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(
 
 # MAGIC %md
 # MAGIC ## Who can see PHI
-# MAGIC A **dynamic view** shows PHI only to members of a `phi_readers` group. You aren't in that group, so you'll
-# MAGIC see `***`. To try it, create the group in the account console, add yourself, and re-run the query.
+# MAGIC A **dynamic view** shows PHI only to members of the `phi_readers` account group. Everyone else sees `***`.
 # MAGIC
-# MAGIC The table-level alternative is a Unity Catalog **column mask** (`ALTER TABLE ... ALTER COLUMN ... SET MASK fn`).
-# MAGIC One gotcha: if you mask a table the pipeline itself *reads*, such as silver, the job's identity must be in the
-# MAGIC group too, or gold gets built from redacted values. That's why the masking here is applied on the consumer side.
+# MAGIC Masking is applied on the consumer side on purpose. A Unity Catalog **column mask** on a table the pipeline
+# MAGIC itself reads, such as silver, would require the job's identity to be in the group too. Otherwise gold would be
+# MAGIC built from redacted values.
 
 # COMMAND ----------
 

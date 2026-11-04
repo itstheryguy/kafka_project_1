@@ -10,9 +10,8 @@
 # MAGIC Bronze stores payloads exactly as received, plus Kafka metadata. If parsing logic changes later,
 # MAGIC silver can be rebuilt from bronze without re-reading Kafka. That matters because Kafka retention is finite.
 # MAGIC
-# MAGIC **Serverless note:** serverless compute only supports `availableNow` triggers. Each run processes
-# MAGIC everything new since the last checkpoint and then stops. This is incremental batch, which is how you'd
-# MAGIC schedule it as a Job.
+# MAGIC **Trigger:** `availableNow` processes everything new since the last checkpoint and then stops (incremental
+# MAGIC batch). It's the trigger serverless compute supports, and the `adt_pipeline` job runs it on a daily schedule.
 
 # COMMAND ----------
 

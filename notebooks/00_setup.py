@@ -9,8 +9,8 @@
 # MAGIC | `<catalog>.adt_demo` schema | holds bronze, silver, and gold tables |
 # MAGIC | `<catalog>.adt_demo.checkpoints` volume | streaming checkpoint storage |
 # MAGIC
-# MAGIC **Catalog name:** trial / Free Edition workspaces usually come with a catalog named `workspace`
-# MAGIC (or one named after your workspace). Check **Catalog** in the left sidebar and set the widget below.
+# MAGIC The `catalog` and `schema` widgets default to `workspace.adt_demo`. When the notebook runs as part of the
+# MAGIC `adt_pipeline` job, the job parameters set them (see `databricks.yml`).
 
 # COMMAND ----------
 
