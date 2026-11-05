@@ -9,6 +9,9 @@ All patients are fake (Faker). Patients still in-house at the end of a run are s
 producer/state/in_house.json. The next run picks them up and continues their stays (transfers, updates,
 discharges) alongside new admits, so downstream MERGEs see real updates and not just inserts.
 
+The scheduled job runs the same code from notebooks/01_produce_events.py, keeping its state in a
+Unity Catalog volume. Run it locally only for testing so the two states don't diverge.
+
 Usage:
     python producer/produce_events.py --dry-run          # print a few messages, no Kafka needed
     python producer/produce_events.py --encounters 50
@@ -24,10 +27,14 @@ import uuid
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
-from dotenv import load_dotenv
 from faker import Faker
 
-load_dotenv()
+try:  # local runs read .env; the Databricks notebook passes credentials in directly
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 ADT_TOPIC = os.getenv("KAFKA_ADT_TOPIC", "adt_events")
 DETAILS_TOPIC = os.getenv("KAFKA_DETAILS_TOPIC", "encounter_details")
 STATE_FILE = Path(__file__).parent / "state" / "in_house.json"
@@ -186,10 +193,11 @@ def simulate(n_new: int, hours: int, now: datetime, state: dict | None) -> tuple
     return messages, {"as_of": now.isoformat(), "encounters": in_house}
 
 
-def load_state() -> dict | None:
-    if not STATE_FILE.exists():
+def load_state(path: Path = STATE_FILE) -> dict | None:
+    path = Path(path)
+    if not path.exists():
         return None
-    state = json.loads(STATE_FILE.read_text())
+    state = json.loads(path.read_text())
     for enc in state["encounters"]:
         enc["admit"] = datetime.fromisoformat(enc["admit"])
         enc["discharge"] = datetime.fromisoformat(enc["discharge"])
@@ -197,42 +205,27 @@ def load_state() -> dict | None:
     return state
 
 
-def save_state(state: dict):
-    STATE_FILE.parent.mkdir(exist_ok=True)
-    STATE_FILE.write_text(json.dumps(state, default=lambda v: v.isoformat(), indent=1))
+def save_state(state: dict, path: Path = STATE_FILE):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state, default=lambda v: v.isoformat(), indent=1))
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--encounters", type=int, default=50, help="new admits this run")
-    parser.add_argument("--hours", type=int, default=72, help="simulated window for the first run")
-    parser.add_argument("--delay", type=float, default=0.02, help="seconds between messages")
-    parser.add_argument("--dry-run", action="store_true", help="print a few messages instead of sending")
-    parser.add_argument("--fresh", action="store_true", help="ignore saved in-house patients")
-    args = parser.parse_args()
-
-    now = datetime.now(timezone.utc).replace(microsecond=0)
-    state = None if args.fresh else load_state()
-    messages, next_state = simulate(args.encounters, args.hours, now, state)
-    if state:
-        print(f"Continuing {len(state['encounters'])} in-house encounters from {state['as_of']}")
-
-    if args.dry_run:
-        for _, topic, key, value in messages[:6]:
-            print(f"--- {topic} key={key}\n{value.replace(chr(13), chr(10))}\n")
-        print(f"{len(messages)} messages generated")
-        return
-
-    from confluent_kafka import Producer
-
-    producer = Producer({
-        "bootstrap.servers": os.environ["KAFKA_BOOTSTRAP_SERVERS"],
+def kafka_config(bootstrap_servers: str, api_key: str, api_secret: str) -> dict:
+    return {
+        "bootstrap.servers": bootstrap_servers,
         "security.protocol": "SASL_SSL",
         "sasl.mechanisms": "PLAIN",
-        "sasl.username": os.environ["KAFKA_API_KEY"],
-        "sasl.password": os.environ["KAFKA_API_SECRET"],
-    })
+        "sasl.username": api_key,
+        "sasl.password": api_secret,
+    }
 
+
+def send(messages: list, config: dict, delay: float = 0.0) -> tuple[int, int]:
+    """Publish messages to Kafka. Returns (sent, failed)."""
+    from confluent_kafka import Producer
+
+    producer = Producer(config)
     failures = []
 
     def on_delivery(err, msg):
@@ -248,16 +241,53 @@ def main():
             producer.produce(topic, key=key, value=value, callback=on_delivery)
             sent += 1
         producer.poll(0)
-        time.sleep(args.delay)
-
+        if delay:
+            time.sleep(delay)
     producer.flush()
-    if failures:
+    return sent, len(failures)
+
+
+def run(n_new: int, config: dict | None, state_path: Path = STATE_FILE, hours: int = 72,
+        delay: float = 0.0, fresh: bool = False) -> dict:
+    """One producer run: continue in-house patients, admit n_new, publish, save state.
+
+    config=None is a dry run: messages are generated and printed, nothing is sent or saved.
+    """
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    state = None if fresh else load_state(state_path)
+    messages, next_state = simulate(n_new, hours, now, state)
+    carried = len(state["encounters"]) if state else 0
+    print(f"New admits: {n_new}; continuing {carried} in-house encounters"
+          + (f" from {state['as_of']}" if state else ""))
+
+    if config is None:
+        for _, topic, key, value in messages[:6]:
+            print(f"--- {topic} key={key}\n{value.replace(chr(13), chr(10))}\n")
+        print(f"{len(messages)} messages generated (dry run, nothing sent)")
+        return {"generated": len(messages), "sent": 0, "in_house": len(next_state["encounters"])}
+
+    sent, failed = send(messages, config, delay)
+    if failed:
         # Don't advance the simulation past messages Kafka never received.
-        print(f"{len(failures)} of {sent} messages failed; in-house state NOT saved. Fix the error and re-run.")
-        return
-    save_state(next_state)
+        raise RuntimeError(f"{failed} of {sent} messages failed; in-house state NOT saved. Fix and re-run.")
+    save_state(next_state, state_path)
     print(f"Sent {sent} messages ({sent - len(messages)} duplicates); "
           f"{len(next_state['encounters'])} patients still in-house")
+    return {"generated": len(messages), "sent": sent, "in_house": len(next_state["encounters"])}
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--encounters", type=int, default=50, help="new admits this run")
+    parser.add_argument("--hours", type=int, default=72, help="simulated window for the first run")
+    parser.add_argument("--delay", type=float, default=0.02, help="seconds between messages")
+    parser.add_argument("--dry-run", action="store_true", help="print a few messages instead of sending")
+    parser.add_argument("--fresh", action="store_true", help="ignore saved in-house patients")
+    args = parser.parse_args()
+
+    config = None if args.dry_run else kafka_config(
+        os.environ["KAFKA_BOOTSTRAP_SERVERS"], os.environ["KAFKA_API_KEY"], os.environ["KAFKA_API_SECRET"])
+    run(args.encounters, config, hours=args.hours, delay=args.delay, fresh=args.fresh)
 
 
 if __name__ == "__main__":

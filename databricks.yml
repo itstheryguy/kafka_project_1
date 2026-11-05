@@ -3,6 +3,7 @@
 #   databricks bundle validate            # check config
 #   databricks bundle deploy -t dev       # deploy dev copy (schedule paused, writes to adt_demo_dev)
 #   databricks bundle run adt_pipeline    # trigger a run of the dev copy
+#   databricks bundle run adt_pipeline --params encounters=500   # override the random admit count
 #   databricks bundle deploy -t prod      # deploy scheduled copy (writes to adt_demo)
 
 bundle:
@@ -15,6 +16,9 @@ variables:
   schema:
     description: Schema for bronze/silver/gold tables and checkpoints
     default: adt_demo
+  producer_dry_run:
+    description: When true, the producer task generates messages but doesn't publish them
+    default: "false"
 
 resources:
   jobs:
@@ -27,6 +31,11 @@ resources:
           default: ${var.catalog}
         - name: schema
           default: ${var.schema}
+        # New admits per producer run. Blank picks a random 32-84.
+        - name: encounters
+          default: ""
+        - name: producer_dry_run
+          default: ${var.producer_dry_run}
       schedule:
         quartz_cron_expression: "0 0 6 * * ?"
         timezone_id: America/Denver
@@ -39,9 +48,15 @@ resources:
           notebook_task:
             notebook_path: ./notebooks/00_setup.py
 
-        - task_key: bronze
+        - task_key: produce
           depends_on:
             - task_key: setup
+          notebook_task:
+            notebook_path: ./notebooks/01_produce_events.py
+
+        - task_key: bronze
+          depends_on:
+            - task_key: produce
           notebook_task:
             notebook_path: ./notebooks/02_bronze_ingest.py
           max_retries: 1
@@ -68,6 +83,8 @@ targets:
     default: true
     variables:
       schema: adt_demo_dev
+      # Dev reads the same topics as prod, so it must never publish to them.
+      producer_dry_run: "true"
 
   prod:
     mode: production
