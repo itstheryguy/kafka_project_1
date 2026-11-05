@@ -64,8 +64,24 @@ In a real hospital, the interface engine would publish ADT messages to Kafka, an
 - **Missing API details don't block the pipeline.** The gold join is a left join, and those encounters are flagged `PENDING_DETAILS`.
 - **The EHR feed only sends what changed.** A row hash skips no-op updates, and Change Data Feed exposes exactly which rows each run inserted or updated.
 - **PHI is separated by use case:** an identified EHR feed, a de-identified analytics table, and masking on the consumer side so the pipeline never reads redacted values.
-- **Least-privilege credentials:** the producer has a write-only Kafka key and bronze has a read-only one, both read from a Databricks secret scope.
+- **Least-privilege credentials:** the producer has a write-only Kafka key and bronze has a read-only one, both read from a Databricks secret scope. See [Security](#security).
 - **Dev never publishes.** The dev copy of the job reads the same topics as prod, so its producer runs in dry-run mode. Otherwise dev-only patients would show up in prod's census and never be discharged.
+
+## Security
+
+All patient data here is synthetic, but the pipeline is built the way it would be for real PHI:
+
+- **Secrets stay out of code.** Kafka credentials and the hashing key live in Databricks secret scopes (`kafka`, `deid`). `.env` for local runs is git-ignored.
+- **Least-privilege Kafka keys.** The producer's key can only write to the two topics, and bronze's key can only read them.
+- **PHI is separated by use case.** `gold_ehr_encounter_sync` holds identified data for the EHR feed. `gold_encounter_analytics` drops names, MRN, DOB and address, and replaces age with a band. The `v_ehr_sync_care_team` view masks identifiers for anyone outside the `phi_readers` group.
+- **Encounter IDs are hashed with a secret key.** A plain SHA-256 of an ID like `ENC123456789` can be reversed by hashing all ~900 million possible IDs and matching, which takes minutes. Gold computes `sha2(key || encounter_id)` with a random key from the `deid` scope, so without the key nobody can reproduce or reverse the hashes. The key is constant, so `encounter_key` stays stable for joins across runs. Rotating it changes every key, so it's done as a planned re-key.
+
+**What a production version would add:**
+
+- **Dates:** HIPAA Safe Harbor counts any date more specific than the year (such as `admit_date`) as an identifier. Either shift or coarsen dates, or use Expert Determination to justify keeping them.
+- **Ages over 89** must be grouped together (the `80+` band already covers this), and ZIP codes reduced to three digits if they're added.
+- **Access controls:** Unity Catalog grants so analysts can read `gold_encounter_analytics` but not the identified tables, plus audit logs to review who queried PHI.
+- **Quarantine** for messages that fail parsing, instead of filtering them out.
 
 ## Layout
 
@@ -133,6 +149,10 @@ databricks secrets put-secret kafka api-key
 databricks secrets put-secret kafka api-secret            # read-only consumer key
 databricks secrets put-secret kafka producer-api-key
 databricks secrets put-secret kafka producer-api-secret   # write-only producer key
+
+# Key for hashing encounter IDs in the de-identified table
+databricks secrets create-scope deid
+databricks secrets put-secret deid encounter-hash-key --string-value "$(openssl rand -hex 32)"
 ```
 
 ## 4. Run

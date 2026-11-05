@@ -47,5 +47,13 @@ try:
     if missing:
         print("Missing:", missing)
 except Exception as e:
-    print("Secret scope 'kafka' not found yet. See README → 'Store Confluent credentials'.")
+    print("Secret scope 'kafka' not found yet. See README → 'Credentials'.")
+    print(e)
+
+# Notebook 04 hashes encounter IDs with a secret key so the de-identified table can't be reversed.
+try:
+    dbutils.secrets.get("deid", "encounter-hash-key")
+    print("Found secret 'encounter-hash-key' in scope 'deid'")
+except Exception as e:
+    print("Secret 'deid/encounter-hash-key' not found yet. See README → 'Credentials'.")
     print(e)

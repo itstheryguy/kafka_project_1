@@ -90,18 +90,22 @@ display(spark.sql(f"""
 
 # MAGIC %md
 # MAGIC ## gold_encounter_analytics (de-identified)
-# MAGIC No names, MRN, DOB, or address. Age becomes an age band, and the encounter ID is replaced with a hash.
+# MAGIC No names, MRN, DOB, or address. Age becomes an age band, and the encounter ID is replaced with a **keyed hash**.
 # MAGIC
-# MAGIC **Limitations:** under HIPAA Safe Harbor, dates more specific than the year (like `admit_date`) also count as
-# MAGIC identifiers, and an unsalted hash of a known ID can be reversed by anyone holding the ID list. A production
-# MAGIC version would use a salted hash (salt kept in a secret scope) and coarsen dates as needed.
+# MAGIC A plain SHA-256 of the encounter ID could be reversed by hashing every possible ID (`ENC` + 9 digits) and matching.
+# MAGIC Mixing in a secret key from the `deid` secret scope prevents that: without the key, nobody can reproduce the hashes.
+# MAGIC The key is the same on every run, so `encounter_key` stays stable for joins. Rotating it re-keys the whole table.
+# MAGIC
+# MAGIC **Limitation:** under HIPAA Safe Harbor, dates more specific than the year (like `admit_date`) also count as
+# MAGIC identifiers. A production version would coarsen them or use Expert Determination. See the README's Security section.
 
 # COMMAND ----------
 
+hash_key = dbutils.secrets.get("deid", "encounter-hash-key")
 age = F.floor(F.months_between("admit_ts", "dob") / 12)
 
 analytics = stitched.select(
-    F.sha2("encounter_id", 256).alias("encounter_key"),
+    F.sha2(F.concat(F.lit(hash_key), "encounter_id"), 256).alias("encounter_key"),
     F.when(age < 18, "0-17").when(age < 45, "18-44").when(age < 65, "45-64").when(age < 80, "65-79")
      .otherwise("80+").alias("age_band"),
     "sex", "hospital_service", "unit", "status",

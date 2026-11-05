@@ -51,6 +51,7 @@ kafka_options = {
 
 
 def ingest(topic, table):
+    """Stream one Kafka topic into a bronze table, storing the payload as-is plus Kafka metadata."""
     raw = spark.readStream.format("kafka").options(**kafka_options).option("subscribe", topic).load()
     return (
         raw.select(
